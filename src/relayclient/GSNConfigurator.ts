@@ -34,6 +34,7 @@ const defaultGsnConfig: GSNConfig = {
   deployVerifierAddress: constants.ZERO_ADDRESS,
   relayVerifierAddress: constants.ZERO_ADDRESS,
   forwarderAddress: constants.ZERO_ADDRESS,
+  proxyFactoryAddress: constants.ZERO_ADDRESS,
   logLevel: 0,
   clientId: '1'
 }
@@ -110,6 +111,7 @@ export interface GSNConfig {
   deployVerifierAddress: Address
   relayVerifierAddress: Address
   forwarderAddress: Address
+  proxyFactoryAddress: Address
   chainId: number
   clientId: IntString
 }
