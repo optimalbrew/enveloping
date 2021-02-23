@@ -1,24 +1,31 @@
 import abi from 'web3-eth-abi'
 import ethUtils from 'ethereumjs-util'
 import web3Utils from 'web3-utils'
+import sigUtil from 'eth-sig-util'
 import { EventData } from 'web3-eth-contract'
 import { JsonRpcResponse } from 'web3-core-helpers'
-import { PrefixedHexString } from 'ethereumjs-tx'
+import { PrefixedHexString, Transaction } from 'ethereumjs-tx'
 
 import { Address, IntString } from '../relayclient/types/Aliases'
 import { ServerConfigParams } from '../relayserver/ServerConfigParams'
 
 import TypedRequestData, { getDomainSeparatorHash } from './EIP712/TypedRequestData'
-import { GSNConfig } from '../relayclient/GSNConfigurator'
+import { getDependencies, GSNConfig, GSNDependencies } from '../relayclient/GSNConfigurator'
 import chalk from 'chalk'
 
-import signTypedData_v4 from 'eth-sig-util'
 import HttpClient from '../relayclient/HttpClient'
 import { DeployRequest, RelayRequest } from './EIP712/RelayRequest'
 
 import ContractInteractor, { Web3Provider } from '../relayclient/ContractInteractor'
-import { RelayMetadata } from '../relayclient/types/RelayTransactionRequest'
+import { DeployTransactionRequest, RelayMetadata, RelayTransactionRequest } from '../relayclient/types/RelayTransactionRequest'
 import HttpWrapper from '../relayclient/HttpWrapper'
+import { IKnownRelaysManager } from '../relayclient/KnownRelaysManager'
+import RelaySelectionManager from '../relayclient/RelaySelectionManager'
+import GsnTransactionDetails from '../relayclient/types/GsnTransactionDetails'
+import { constants } from './Constants'
+import { RelayingAttempt, RelayingResult } from '../relayclient/RelayClient'
+import { RelayInfo } from '../relayclient/types/RelayInfo'
+import { HttpProvider } from 'web3-core'
 
 export function removeHexPrefix (hex: string): string {
   if (hex == null || typeof hex.replace !== 'function') {
@@ -83,7 +90,7 @@ export function getLocalEip712Signature (
   }
 
   // @ts-ignore
-  return signTypedData_v4(privateKey, { data: dataToSign })
+  return sigUtil.signTypedData_v4(privateKey, { data: dataToSign })
 }
 
 export async function getEip712Signature (
@@ -245,38 +252,47 @@ export function boolString (bool: boolean): string {
 }
 
 export class EnvelopingUtils {
-  readonly PROXY_FACTORY_ADDRESS = '0'
-  readonly ZERO_ADDRESS = '0x0000000000000000000000000000000000000000'
   
   config: GSNConfig
-  relayHubAddress: Address
-  contractInteractor: ContractInteractor
+  relayWorkerAddress : Address
+  dependencies: GSNDependencies
+  private initialized: boolean
 
-  constructor(_config: GSNConfig, _web3 : Web3) {
+  constructor(_config: GSNConfig, _web3 : Web3, _relayWorkerAddress : Address) {
     this.config = _config
-    this.relayHubAddress = this.config.relayHubAddress
-    this.contractInteractor = new ContractInteractor(_web3.currentProvider as Web3Provider, this.config)
+    this.initialized = false
+    this.dependencies = getDependencies(this.config, _web3.currentProvider as HttpProvider)
+    this.relayWorkerAddress = _relayWorkerAddress
   }
 
-  async createDeployRequest(relayWorkerAddress: Address, from: Address, gasLimit: IntString, tokenContract:  Address, tokenAmount: IntString, index? : IntString, recoverer? : IntString, gasPrice?: IntString): Promise<DeployRequest> {
-    
+  async _init() : Promise<void> {
+    if(!this.initialized) {
+      await this.dependencies.contractInteractor.init()
+      this.initialized = true
+    } else {
+      throw new Error('_init was already called')
+    }
+  }
+
+  async createDeployRequest(from: Address, gasLimit: IntString, tokenContract:  Address, tokenAmount: IntString, tokenGas: IntString, gasPrice?: IntString, index? : IntString, recoverer? : IntString): Promise<DeployRequest> {
     const deployRequest : DeployRequest = {
       request: {
-      relayHub: this.relayHubAddress,
+      relayHub: this.config.relayHubAddress,
       from: from,
-      to: this.PROXY_FACTORY_ADDRESS,
+      to: this.config.proxyFactoryAddress,
       value: '0',
-      gas: gasLimit,
-      nonce: await this.getFactoryNonce(this.PROXY_FACTORY_ADDRESS, from).toString(),
+      gas: gasLimit, //overhead (cte) + fee + (estimateDeploy * 1.1)
+      nonce: this.getFactoryNonce(this.config.proxyFactoryAddress, from).toString(),
       data: '0x',
       tokenContract: tokenContract,
       tokenAmount: tokenAmount,
-      recoverer: recoverer ?? this.ZERO_ADDRESS,
+      tokenGas: tokenGas,
+      recoverer: recoverer ?? constants.ZERO_ADDRESS,
       index: index ?? '0'
     }, 
     relayData: {
       gasPrice: gasPrice ?? '0',
-      relayWorker: relayWorkerAddress,
+      relayWorker: this.relayWorkerAddress,
       callForwarder: this.config.forwarderAddress,
       callVerifier: this.config.deployVerifierAddress,
       domainSeparator: getDomainSeparatorHash(this.config.forwarderAddress, this.config.chainId)
@@ -286,11 +302,10 @@ export class EnvelopingUtils {
     return deployRequest
   }
   
-  async createRelayRequest(relayWorkerAddress: Address, from: Address, to: Address, data: PrefixedHexString, gasLimit: IntString, tokenContract:  Address, tokenAmount: IntString, index? : IntString, recoverer? : IntString, gasPrice?: IntString): Promise<RelayRequest> {
-    
+  async createRelayRequest(from: Address, to: Address, data: PrefixedHexString, gasLimit: IntString, tokenContract:  Address, tokenAmount: IntString, tokenGas: IntString, gasPrice?: IntString): Promise<RelayRequest> {
     const relayRequest : RelayRequest = {
       request: {
-      relayHub: this.relayHubAddress,
+      relayHub: this.config.relayHubAddress,
       from: from,
       to: to,
       data: data,
@@ -299,12 +314,13 @@ export class EnvelopingUtils {
       nonce: this.getSenderNonce(this.config.forwarderAddress).toString(),
       tokenContract: tokenContract,
       tokenAmount: tokenAmount,
+      tokenGas: tokenGas
     }, 
     relayData: {
       gasPrice: gasPrice ?? '0',
-      relayWorker: relayWorkerAddress,
+      relayWorker: this.relayWorkerAddress,
       callForwarder: this.config.forwarderAddress,
-      callVerifier: this.config.deployVerifierAddress,
+      callVerifier: this.config.relayVerifierAddress,
       domainSeparator: getDomainSeparatorHash(this.config.forwarderAddress, this.config.chainId)
     }
   }
@@ -314,36 +330,174 @@ export class EnvelopingUtils {
 
   signRequest(privKey : Buffer, request : RelayRequest|DeployRequest) : PrefixedHexString {
     const cloneRequest = { ...request }
-    const signedData = new TypedRequestData(
+    const dataToSign = new TypedRequestData(
         this.config.chainId,
         this.config.forwarderAddress,
         cloneRequest
     )
-
-    return signTypedData_v4(privKey, { data: signedData })
+    
+    // @ts-ignore
+    return sigUtil.signTypedData_v4(privKey, { data: dataToSign })
   }
 
-  // sendHttpRequest(request : RelayRequest|DeployRequest, signature : PrefixedHexString) {
-  //   const metadata: RelayMetadata = {
-  //     relayHubAddress: this.relayHubAddress,
-  //     signature: signature,
-  //     approvalData: '0x',
-  //     relayMaxNonce: this.web3.eth.getTransactionCount(RELAY_WORKER_ADDRESS, defaultBlock) + (0 || 3)
-  //   }
+  async generateMetadata(signature : PrefixedHexString) : Promise<RelayMetadata> {
+    const metadata: RelayMetadata = {
+      relayHubAddress: this.config.relayHubAddress,
+      signature: signature,
+      approvalData: '0x',
+      relayMaxNonce: await this.dependencies.contractInteractor.getTransactionCount(this.relayWorkerAddress) + this.config.maxRelayNonceGap
+    }
 
-  //   const httpClient = new HttpClient(new HttpWrapper(), config)
-  //   httpClient.relayTransaction
-  //   call '/relay' with httpRequest
-  // }
+    return metadata
+  }
 
+  async sendHttpRelayRequest(relayRequest : RelayRequest, signature : PrefixedHexString) : Promise<RelayingResult> {
+    const metadata: RelayMetadata = await this.generateMetadata(signature)
+    const relayTransactionRequest : RelayTransactionRequest = {
+      relayRequest,
+      metadata
+    }
+    const knownRelaysManager = this.dependencies.knownRelaysManager
+    await knownRelaysManager.refresh()
+    const gsnTransactionDetails = this.createTransactionDetails(relayRequest.request.from, relayRequest.request.data, relayRequest.request.from, relayRequest.request.value, relayRequest.request.tokenContract, 
+      relayRequest.request.tokenAmount, relayRequest.request.tokenGas)
+    const relaySelectionManager = await new RelaySelectionManager(gsnTransactionDetails, knownRelaysManager, this.dependencies.httpClient, this.dependencies.pingFilter, this.config).init()
+    const relayingErrors = new Map<string, Error>()
+    while(true) {
+      let relayingAttempt: RelayingAttempt | undefined
+      const activeRelay = await relaySelectionManager.selectNextRelay()
+      if (activeRelay !== undefined && activeRelay !== null) {
+        relayingAttempt = await this._attemptRelay(knownRelaysManager, activeRelay, gsnTransactionDetails, relayTransactionRequest).catch(error => ({ error }))
+        if (relayingAttempt.transaction === undefined || relayingAttempt.transaction === null) {
+          relayingErrors.set(activeRelay.relayInfo.relayUrl, relayingAttempt.error ?? new Error('No error reason was given'))
+          continue
+        }
+        return {
+          transaction: relayingAttempt?.transaction,
+          relayingErrors,
+          pingErrors: relaySelectionManager.errors
+        }
+      }
+    }
+  }
 
+  async sendHttpDeployRequest(deployRequest : DeployRequest, signature : PrefixedHexString) : Promise<RelayingResult> {
+    const metadata: RelayMetadata = await this.generateMetadata(signature)
+    const deployTransactionRequest : DeployTransactionRequest = {
+      relayRequest: deployRequest,
+      metadata
+    }
+    const knownRelaysManager = this.dependencies.knownRelaysManager
+    await knownRelaysManager.refresh()
+    const gsnTransactionDetails = this.createTransactionDetails(deployRequest.request.from, deployRequest.request.data, deployRequest.request.from, deployRequest.request.value, deployRequest.request.tokenContract, 
+      deployRequest.request.tokenAmount, deployRequest.request.tokenGas)
+    const relaySelectionManager = await new RelaySelectionManager(gsnTransactionDetails, knownRelaysManager, this.dependencies.httpClient, this.dependencies.pingFilter, this.config).init()
+    const relayingErrors = new Map<string, Error>()
+    while (true) {
+      let relayingAttempt: RelayingAttempt | undefined
+      const activeRelay = await relaySelectionManager.selectNextRelay()
+      if (activeRelay !== undefined && activeRelay !== null) {
+        relayingAttempt = await this._attemptDeploy(knownRelaysManager, activeRelay, gsnTransactionDetails, deployTransactionRequest).catch(error => ({ error }))
+        if (relayingAttempt.transaction === undefined || relayingAttempt.transaction === null) {
+          relayingErrors.set(activeRelay.relayInfo.relayUrl, relayingAttempt.error ?? new Error('No error reason was given'))
+          continue
+        }
+        return {
+          transaction: relayingAttempt?.transaction,
+          relayingErrors,
+          pingErrors: relaySelectionManager.errors
+        }
+      }
+    }
+  }
 
+  async _attemptRelay(knownRelaysManager: IKnownRelaysManager, relayInfo: RelayInfo, gsnTransactionDetails: GsnTransactionDetails, request: RelayTransactionRequest): Promise<RelayingAttempt> {
+    // log.info(`attempting relay: ${JSON.stringify(relayInfo)} transaction: ${JSON.stringify(gsnTransactionDetails)}`)
+    const maxAcceptanceBudget = parseInt(relayInfo.pingResponse.maxAcceptanceBudget)
+    let acceptRelayCallResult = await this.dependencies.contractInteractor.validateAcceptRelayCall(request.relayRequest, request.metadata.signature, request.metadata.approvalData)
+    
+    if (!acceptRelayCallResult.verifierAccepted) {
+      let message: string
+      if (acceptRelayCallResult.reverted) {
+        message = 'local view call to \'relayCall()\' reverted'
+      } else {
+        message = 'verifier rejected in local view call to \'relayCall()\' '
+      }
+      return { error: new Error(`${message}: ${decodeRevertReason(acceptRelayCallResult.returnValue)}`) }
+    }
+    let hexTransaction: PrefixedHexString
+    try {
+      hexTransaction = await this.dependencies.httpClient.relayTransaction(relayInfo.relayInfo.relayUrl, request)
+    } catch (error) {
+      if (error?.message == null || error.message.indexOf('timeout') !== -1) {
+        knownRelaysManager.saveRelayFailure(new Date().getTime(), relayInfo.relayInfo.relayManager, relayInfo.relayInfo.relayUrl)
+      }
+      return { error }
+    }
+    const transaction = new Transaction(hexTransaction, this.dependencies.contractInteractor.getRawTxOptions())
+    if (!this.dependencies.transactionValidator.validateRelayResponse(request, maxAcceptanceBudget, hexTransaction)) {
+      knownRelaysManager.saveRelayFailure(new Date().getTime(), relayInfo.relayInfo.relayManager, relayInfo.relayInfo.relayUrl)
+      return { error: new Error('Returned transaction did not pass validation') }
+    }
+    return {
+      transaction
+    }
+  } 
+
+  async _attemptDeploy(knownRelaysManager: IKnownRelaysManager, relayInfo: RelayInfo, gsnTransactionDetails: GsnTransactionDetails, request: DeployTransactionRequest): Promise<RelayingAttempt> {
+    // log.info(`attempting relay: ${JSON.stringify(relayInfo)} transaction: ${JSON.stringify(gsnTransactionDetails)}`)
+    const maxAcceptanceBudget = parseInt(relayInfo.pingResponse.maxAcceptanceBudget)
+    let acceptDeployCallResult = await this.dependencies.contractInteractor.validateAcceptDeployCall(request.relayRequest, request.metadata.signature, request.metadata.approvalData)
+    
+    if (!acceptDeployCallResult.verifierAccepted) {
+      let message: string
+      if (acceptDeployCallResult.reverted) {
+        message = 'local view call to \'relayCall()\' reverted'
+      } else {
+        message = 'verifier rejected in local view call to \'relayCall()\' '
+      }
+      return { error: new Error(`${message}: ${decodeRevertReason(acceptDeployCallResult.returnValue)}`) }
+    }
+    let hexTransaction: PrefixedHexString
+    try {
+      hexTransaction = await this.dependencies.httpClient.relayTransaction(relayInfo.relayInfo.relayUrl, request)
+    } catch (error) {
+      if (error?.message == null || error.message.indexOf('timeout') !== -1) {
+        knownRelaysManager.saveRelayFailure(new Date().getTime(), relayInfo.relayInfo.relayManager, relayInfo.relayInfo.relayUrl)
+      }
+      return { error }
+    }
+    const transaction = new Transaction(hexTransaction, this.dependencies.contractInteractor.getRawTxOptions())
+    if (!this.dependencies.transactionValidator.validateRelayResponse(request, maxAcceptanceBudget, hexTransaction)) {
+      knownRelaysManager.saveRelayFailure(new Date().getTime(), relayInfo.relayInfo.relayManager, relayInfo.relayInfo.relayUrl)
+      return { error: new Error('Returned transaction did not pass validation') }
+    }
+    return {
+      transaction
+    }
+  } 
 
   async getSenderNonce (sWallet: Address): Promise<IntString> {
-    return await this.contractInteractor.getSenderNonce(sWallet)
+    return await this.dependencies.contractInteractor.getSenderNonce(sWallet)
   }
 ​
   async getFactoryNonce (factoryAddr: Address, from: Address): Promise<IntString> {
-    return await this.contractInteractor.getFactoryNonce(factoryAddr, from)
+    return await this.dependencies.contractInteractor.getFactoryNonce(factoryAddr, from)
+  }
+
+  createTransactionDetails(from: Address, data: PrefixedHexString, to: Address, value: IntString, tokenContract?: Address, tokenAmount?: IntString, tokenGas?: IntString, recoverer?: Address, index?: IntString) : GsnTransactionDetails {
+    const gsnTransactionDetails : GsnTransactionDetails = {
+      from,
+      data,
+      to,
+      tokenContract: tokenContract?? constants.ZERO_ADDRESS,
+      tokenAmount: tokenAmount ?? '0x00',
+      tokenGas: tokenGas ?? '0x00',
+      value,
+      recoverer: recoverer?? '0',
+      index: index?? '0',
+      isSmartWalletDeploy: true,
+    }
+    return gsnTransactionDetails
   }
 }
